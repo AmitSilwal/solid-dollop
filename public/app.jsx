@@ -228,7 +228,11 @@ function App() {
     localStorage.setItem('chat-auth', JSON.stringify(auth));
     loadUsers(auth.token);
 
-    const client = io({ auth: { token: auth.token } });
+    const client = io(window.location.origin, {
+      transports: ['websocket', 'polling'],
+      auth: (cb) => cb({ token: `Bearer ${auth.token}` }),
+      query: { token: auth.token }
+    });
 
     client.on('connect_error', () => {
       setError('Socket connection failed. Please log in again.');
