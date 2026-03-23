@@ -1,5 +1,167 @@
 const { useEffect, useMemo, useState } = React;
 
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+const E2EE_STORAGE_PREFIX = 'chat-e2ee-keypair';
+
+function toBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function fromBase64(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function exportPublicKey(key) {
+  const spki = await crypto.subtle.exportKey('spki', key);
+  return toBase64(spki);
+}
+
+async function importPublicKey(base64Key) {
+  return crypto.subtle.importKey('spki', fromBase64(base64Key), { name: 'RSA-OAEP', hash: 'SHA-256' }, true, [
+    'encrypt'
+  ]);
+}
+
+async function generateKeyPair() {
+  return crypto.subtle.generateKey(
+    {
+      name: 'RSA-OAEP',
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: 'SHA-256'
+    },
+    true,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function loadOrCreateKeyMaterial(userId) {
+  const storageKey = `${E2EE_STORAGE_PREFIX}:${userId}`;
+  const stored = localStorage.getItem(storageKey);
+
+  if (stored) {
+    const parsed = JSON.parse(stored);
+    const privateKeyCrypto = await crypto.subtle.importKey(
+      'pkcs8',
+      fromBase64(parsed.privateKey),
+      { name: 'RSA-OAEP', hash: 'SHA-256' },
+      true,
+      ['decrypt']
+    );
+
+    return {
+      publicKeyBase64: parsed.publicKey,
+      privateKeyCrypto
+    };
+  }
+
+  const pair = await generateKeyPair();
+  const publicKeyBase64 = await exportPublicKey(pair.publicKey);
+  const privateKeyBase64 = toBase64(await crypto.subtle.exportKey('pkcs8', pair.privateKey));
+
+  localStorage.setItem(
+    storageKey,
+    JSON.stringify({
+      publicKey: publicKeyBase64,
+      privateKey: privateKeyBase64
+    })
+  );
+
+  return {
+    publicKeyBase64,
+    privateKeyCrypto: pair.privateKey
+  };
+}
+
+async function encryptMessage(plainText, senderPublicKeyBase64, recipientPublicKeyBase64) {
+  const symmetricKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, symmetricKey, textEncoder.encode(plainText));
+
+  const exportedSymmetric = await crypto.subtle.exportKey('raw', symmetricKey);
+  const senderPublicKey = await importPublicKey(senderPublicKeyBase64);
+  const recipientPublicKey = await importPublicKey(recipientPublicKeyBase64);
+
+  const senderEncryptedKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, senderPublicKey, exportedSymmetric);
+  const recipientEncryptedKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, recipientPublicKey, exportedSymmetric);
+
+  return {
+    algorithm: 'AES-GCM+RSA-OAEP',
+    ciphertext: toBase64(ciphertext),
+    iv: toBase64(iv.buffer),
+    senderEncryptedKey: toBase64(senderEncryptedKey),
+    recipientEncryptedKey: toBase64(recipientEncryptedKey)
+  };
+}
+
+async function decryptMessage(message, authUserId, privateKey) {
+  if (!message?.encryptedPayload || !privateKey) {
+    return '[Unable to decrypt]';
+  }
+
+  try {
+    const isMine = message.fromUserId === authUserId;
+    const encryptedKey = isMine
+      ? message.encryptedPayload.senderEncryptedKey
+      : message.encryptedPayload.recipientEncryptedKey;
+
+    const symmetricRaw = await crypto.subtle.decrypt(
+      { name: 'RSA-OAEP' },
+      privateKey,
+      fromBase64(encryptedKey)
+    );
+
+    const symmetricKey = await crypto.subtle.importKey('raw', symmetricRaw, { name: 'AES-GCM' }, false, ['decrypt']);
+
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: new Uint8Array(fromBase64(message.encryptedPayload.iv)) },
+      symmetricKey,
+      fromBase64(message.encryptedPayload.ciphertext)
+    );
+
+    return textDecoder.decode(decrypted);
+  } catch (error) {
+    return '[Unable to decrypt]';
+  }
+}
+
+
+function MessageBubble({ message, authUserId, privateKey }) {
+  const mine = message.fromUserId === authUserId;
+  const [decryptedText, setDecryptedText] = useState('[Decrypting...]');
+
+  useEffect(() => {
+    let alive = true;
+    decryptMessage(message, authUserId, privateKey).then((text) => {
+      if (alive) {
+        setDecryptedText(text);
+      }
+    });
+
+    return () => {
+      alive = false;
+    };
+  }, [message, authUserId, privateKey]);
+
+  return (
+    <div className={`message ${mine ? 'me' : 'them'}`}>
+      <div>{decryptedText}</div>
+      <span className="message-time">{new Date(message.timestamp).toLocaleTimeString()}</span>
+    </div>
+  );
+}
+
 function App() {
   const [auth, setAuth] = useState(() => {
     const raw = localStorage.getItem('chat-auth');
@@ -10,11 +172,56 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [socket, setSocket] = useState(null);
   const [error, setError] = useState('');
+  const [keysReady, setKeysReady] = useState(false);
+  const [privateKey, setPrivateKey] = useState(null);
+  const [publicKeyBase64, setPublicKeyBase64] = useState('');
 
   const activeUser = useMemo(() => users.find((u) => u.id === activeUserId), [users, activeUserId]);
 
   useEffect(() => {
     if (!auth) {
+      return;
+    }
+
+    let active = true;
+
+    async function setupE2EE() {
+      try {
+        const keyMaterial = await loadOrCreateKeyMaterial(auth.user.id);
+        const importedPrivate = keyMaterial.privateKeyCrypto;
+        const exportedPublic = keyMaterial.publicKeyBase64;
+
+        if (!active) {
+          return;
+        }
+
+        setPrivateKey(importedPrivate);
+        setPublicKeyBase64(exportedPublic);
+
+        await fetch('/api/me/public-key', {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${auth.token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ publicKey: exportedPublic })
+        });
+
+        setKeysReady(true);
+      } catch (err) {
+        setError('Unable to initialize end-to-end encryption keys.');
+      }
+    }
+
+    setupE2EE();
+
+    return () => {
+      active = false;
+    };
+  }, [auth]);
+
+  useEffect(() => {
+    if (!auth || !keysReady) {
       return;
     }
 
@@ -47,7 +254,7 @@ function App() {
       client.disconnect();
       setSocket(null);
     };
-  }, [auth, activeUserId]);
+  }, [auth, activeUserId, keysReady]);
 
   async function api(path, options = {}) {
     const headers = {
@@ -80,6 +287,7 @@ function App() {
       setUsers([]);
       setMessages([]);
       setActiveUserId('');
+      setKeysReady(false);
     } catch (err) {
       setError(err.message);
     }
@@ -131,19 +339,33 @@ function App() {
     setUsers([]);
     setMessages([]);
     setActiveUserId('');
+    setPrivateKey(null);
+    setPublicKeyBase64('');
+    setKeysReady(false);
   }
 
-  function sendMessage(event) {
+  async function sendMessage(event) {
     event.preventDefault();
     const input = event.target.elements.message;
     const text = input.value.trim();
 
-    if (!text || !activeUserId || !socket) {
+    if (!text || !activeUserId || !socket || !privateKey || !keysReady) {
       return;
     }
 
-    socket.emit('message:send', { toUserId: activeUserId, text });
-    input.value = '';
+    const recipient = users.find((u) => u.id === activeUserId);
+    if (!recipient?.publicKey) {
+      setError('Recipient has no encryption key registered yet.');
+      return;
+    }
+
+    try {
+      const encryptedPayload = await encryptMessage(text, publicKeyBase64, recipient.publicKey);
+      socket.emit('message:send', { toUserId: activeUserId, encryptedPayload });
+      input.value = '';
+    } catch (err) {
+      setError('Failed to encrypt and send message.');
+    }
   }
 
   if (!auth) {
@@ -156,6 +378,9 @@ function App() {
         <h1>Real-time Chat</h1>
         <p>
           Logged in as <strong>{auth.user.username}</strong>
+        </p>
+        <p>
+          <small>Messages are encrypted on the client with AES-GCM + RSA-OAEP.</small>
         </p>
         <button onClick={logout}>Logout</button>
 
@@ -173,7 +398,10 @@ function App() {
                     onClick={() => setActiveUserId(u.id)}
                   >
                     <span>{u.username}</span>
-                    <span className={`status-dot ${u.online ? 'online' : ''}`} />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {!u.hasPublicKey ? <small style={{ color: '#9f1239' }}>No key</small> : null}
+                      <span className={`status-dot ${u.online ? 'online' : ''}`} />
+                    </div>
                   </div>
                 ))
               )}
@@ -183,20 +411,14 @@ function App() {
           <div>
             <h3>{activeUser ? `Chat with ${activeUser.username}` : 'Select a user'}</h3>
             <div className="messages">
-              {messages.map((m) => {
-                const mine = m.fromUserId === auth.user.id;
-                return (
-                  <div key={m.id} className={`message ${mine ? 'me' : 'them'}`}>
-                    <div>{m.text}</div>
-                    <span className="message-time">{new Date(m.timestamp).toLocaleTimeString()}</span>
-                  </div>
-                );
-              })}
+              {messages.map((m) => (
+                <MessageBubble key={m.id} message={m} authUserId={auth.user.id} privateKey={privateKey} />
+              ))}
             </div>
 
             <form onSubmit={sendMessage} style={{ marginTop: 10 }}>
               <input name="message" placeholder="Type a message" autoComplete="off" />
-              <button type="submit" disabled={!activeUserId}>
+              <button type="submit" disabled={!activeUserId || !keysReady}>
                 Send
               </button>
             </form>

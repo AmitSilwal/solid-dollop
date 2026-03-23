@@ -17,14 +17,18 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // In-memory data stores (replace with a database in production)
-const users = new Map(); // username -> { id, username, passwordHash }
+const users = new Map(); // username -> { id, username, passwordHash, publicKey }
 const activeSocketsByUserId = new Map(); // userId -> socket.id
-const messages = []; // { id, fromUserId, toUserId, text, timestamp }
+const messages = []; // { id, fromUserId, toUserId, encryptedPayload, timestamp }
 let nextUserId = 1;
 let nextMessageId = 1;
 
-function publicUser(user) {
-  return { id: user.id, username: user.username };
+function publicUser(user, includePublicKey = false) {
+  return {
+    id: user.id,
+    username: user.username,
+    ...(includePublicKey ? { publicKey: user.publicKey || null } : {})
+  };
 }
 
 function findUserById(userId) {
@@ -88,7 +92,7 @@ app.post('/api/register', async (req, res) => {
   }
 
   const passwordHash = await bcrypt.hash(password, 10);
-  const user = { id: String(nextUserId++), username, passwordHash };
+  const user = { id: String(nextUserId++), username, passwordHash, publicKey: null };
   users.set(username, user);
 
   const token = signToken(user);
@@ -118,12 +122,27 @@ app.post('/api/login', async (req, res) => {
   return res.json({ token, user: publicUser(user) });
 });
 
+app.put('/api/me/public-key', requireApiAuth, (req, res) => {
+  const { publicKey } = req.body;
+
+  if (!publicKey || typeof publicKey !== 'string') {
+    return res.status(400).json({ error: 'A valid publicKey string is required.' });
+  }
+
+  req.authUser.publicKey = publicKey;
+  return res.json({ user: publicUser(req.authUser, true) });
+});
+
 app.get('/api/users', requireApiAuth, (req, res) => {
   const currentUserId = req.user.userId;
 
   const availableUsers = Array.from(users.values())
     .filter((u) => u.id !== currentUserId)
-    .map((u) => ({ ...publicUser(u), online: activeSocketsByUserId.has(u.id) }));
+    .map((u) => ({
+      ...publicUser(u, true),
+      online: activeSocketsByUserId.has(u.id),
+      hasPublicKey: Boolean(u.publicKey)
+    }));
 
   return res.json({ users: availableUsers });
 });
@@ -165,8 +184,20 @@ io.on('connection', (socket) => {
 
   io.emit('presence:update', Array.from(activeSocketsByUserId.keys()));
 
-  socket.on('message:send', ({ toUserId, text }) => {
-    if (!toUserId || !text || !text.trim()) {
+  socket.on('message:send', ({ toUserId, encryptedPayload }) => {
+    if (!toUserId || !encryptedPayload || typeof encryptedPayload !== 'object') {
+      return;
+    }
+
+    const {
+      ciphertext,
+      iv,
+      senderEncryptedKey,
+      recipientEncryptedKey,
+      algorithm = 'AES-GCM+RSA-OAEP'
+    } = encryptedPayload;
+
+    if (!ciphertext || !iv || !senderEncryptedKey || !recipientEncryptedKey) {
       return;
     }
 
@@ -174,7 +205,13 @@ io.on('connection', (socket) => {
       id: String(nextMessageId++),
       fromUserId: userId,
       toUserId,
-      text: text.trim(),
+      encryptedPayload: {
+        ciphertext,
+        iv,
+        senderEncryptedKey,
+        recipientEncryptedKey,
+        algorithm
+      },
       timestamp: new Date().toISOString()
     };
 
