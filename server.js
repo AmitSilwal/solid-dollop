@@ -7,7 +7,12 @@ const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: true,
+    credentials: true
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'replace-with-a-secure-secret';
@@ -41,12 +46,16 @@ function signToken(user) {
   });
 }
 
-function parseBearerToken(header) {
-  if (!header || !header.startsWith('Bearer ')) {
+function parseBearerToken(value) {
+  if (!value || typeof value !== 'string') {
     return null;
   }
 
-  return header.slice('Bearer '.length);
+  if (value.startsWith('Bearer ')) {
+    return value.slice('Bearer '.length).trim();
+  }
+
+  return value.trim() || null;
 }
 
 function verifyToken(token) {
@@ -161,9 +170,10 @@ app.get('/api/messages/:otherUserId', requireApiAuth, (req, res) => {
 });
 
 io.use((socket, next) => {
-  const handshakeToken = socket.handshake.auth?.token;
+  const authToken = parseBearerToken(socket.handshake.auth?.token);
+  const queryToken = parseBearerToken(socket.handshake.query?.token);
   const headerToken = parseBearerToken(socket.handshake.headers.authorization);
-  const token = handshakeToken || headerToken;
+  const token = authToken || queryToken || headerToken;
   if (!token) {
     return next(new Error('Missing auth token'));
   }
