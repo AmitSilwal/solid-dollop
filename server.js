@@ -11,6 +11,7 @@ const io = new Server(server);
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'replace-with-a-secure-secret';
+const JWT_EXPIRY = '24h';
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -26,17 +27,49 @@ function publicUser(user) {
   return { id: user.id, username: user.username };
 }
 
-function requireAuth(req, res, next) {
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) {
+function findUserById(userId) {
+  return Array.from(users.values()).find((user) => user.id === userId) || null;
+}
+
+function signToken(user) {
+  return jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, {
+    expiresIn: JWT_EXPIRY
+  });
+}
+
+function parseBearerToken(header) {
+  if (!header || !header.startsWith('Bearer ')) {
+    return null;
+  }
+
+  return header.slice('Bearer '.length);
+}
+
+function verifyToken(token) {
+  if (!token) {
+    throw new Error('Missing token');
+  }
+
+  const payload = jwt.verify(token, JWT_SECRET);
+  const user = findUserById(payload.userId);
+
+  if (!user) {
+    throw new Error('User no longer exists');
+  }
+
+  return { payload, user };
+}
+
+function requireApiAuth(req, res, next) {
+  const token = parseBearerToken(req.headers.authorization);
+  if (!token) {
     return res.status(401).json({ error: 'Missing or invalid authorization header.' });
   }
 
-  const token = auth.slice('Bearer '.length);
-
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
+    const { payload, user } = verifyToken(token);
     req.user = payload;
+    req.authUser = user;
     return next();
   } catch (error) {
     return res.status(401).json({ error: 'Invalid or expired token.' });
@@ -58,9 +91,7 @@ app.post('/api/register', async (req, res) => {
   const user = { id: String(nextUserId++), username, passwordHash };
   users.set(username, user);
 
-  const token = jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, {
-    expiresIn: '24h'
-  });
+  const token = signToken(user);
 
   return res.status(201).json({ token, user: publicUser(user) });
 });
@@ -82,14 +113,12 @@ app.post('/api/login', async (req, res) => {
     return res.status(401).json({ error: 'Invalid credentials.' });
   }
 
-  const token = jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, {
-    expiresIn: '24h'
-  });
+  const token = signToken(user);
 
   return res.json({ token, user: publicUser(user) });
 });
 
-app.get('/api/users', requireAuth, (req, res) => {
+app.get('/api/users', requireApiAuth, (req, res) => {
   const currentUserId = req.user.userId;
 
   const availableUsers = Array.from(users.values())
@@ -99,7 +128,7 @@ app.get('/api/users', requireAuth, (req, res) => {
   return res.json({ users: availableUsers });
 });
 
-app.get('/api/messages/:otherUserId', requireAuth, (req, res) => {
+app.get('/api/messages/:otherUserId', requireApiAuth, (req, res) => {
   const { otherUserId } = req.params;
   const currentUserId = req.user.userId;
 
@@ -113,14 +142,17 @@ app.get('/api/messages/:otherUserId', requireAuth, (req, res) => {
 });
 
 io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
+  const handshakeToken = socket.handshake.auth?.token;
+  const headerToken = parseBearerToken(socket.handshake.headers.authorization);
+  const token = handshakeToken || headerToken;
   if (!token) {
     return next(new Error('Missing auth token'));
   }
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
+    const { payload, user } = verifyToken(token);
     socket.user = payload;
+    socket.authUser = user;
     return next();
   } catch (error) {
     return next(new Error('Invalid auth token'));
