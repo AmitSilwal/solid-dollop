@@ -5,6 +5,8 @@ A simple real-time chat app built with **Node.js**, **Express**, **Socket.IO**, 
 ## Features
 
 - User registration and login (JWT-based)
+- JWT middleware for protected API routes
+- JWT-gated Socket.IO authentication
 - Online presence indicators
 - Direct messaging between users in real time
 - Conversation history retrieval via API
